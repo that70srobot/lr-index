@@ -1,0 +1,153 @@
+name: targets
+# Per-TARGET dedicated job (replaces the 256-shard design).
+#   * matrix dimension = target (not shard) -> every job serves a distinct, valuable address
+#   * inside a job: 16 sequential 2^28-seed chunks; for each chunk: build 3.2GB index -> run the
+#     reverse walk for THIS ONE target over all 4,177,920 ids -> delete the table.
+#     Total seed coverage = 2^32 (100%), find work = 16 x steps x ids = same as one full-index
+#     pass, and peak disk is only 3.2GB (the old 51GB//mnt requirement is gone).
+#   * calibrated on run 41215712054 (4-core runner, this engine): build 453k keys/s,
+#     find steps=256 over 4.18M ids = 361s => 16*(650s + ~470s) ~= 5.0h < 6h runner cap.
+#   * hit => engine re-derives priv -> pub -> address and only writes match=1 if byte-equal;
+#     the job publishes it to $GITHUB_STEP_SUMMARY, as an artifact, and commits hits/<target>.json.
+on:
+  workflow_dispatch:
+    inputs:
+      only:
+        description: 'comma list of target names, or "all"'
+        required: true
+        default: 'all'
+      chunks:
+        description: 'chunk range a-b inclusive (0-15 = whole 2^32 seed space)'
+        required: true
+        default: '0-15'
+      steps:
+        description: 'reverse steps = rounds r in [0,steps); expected hit round ~2^32/4177920 = 1028'
+        required: true
+        default: '256'
+      selftest:
+        description: 'also re-find the golden vector (seed 777042) in the real chunk-0 table (1/0)'
+        required: true
+        default: '0'
+permissions:
+  contents: write
+jobs:
+  target:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    strategy:
+      fail-fast: false
+      matrix:
+        # ordered by on-chain value (fact13702 / 11792 / 11527 / 11300)
+        target:
+          - 6ab0575a
+          - 4a045fe2
+          - e347
+          - 35bfded2
+          - b0fcbf05
+          - 1977d450
+          - f2ee2927
+          - 2fe9b6
+          - c1039c
+          - bf717b
+          - ba8e58
+          - 29619a
+          - ba8e5c
+          - d5c413
+          - 549d
+          - a29e
+          - f441
+          - owner
+          - safe_cad5
+          - safe_24fc
+          - safe_61db
+          - safe_a757
+          - safe_f8c1
+          - 1977c1d32f
+          - 62b0f494
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: env + engine build
+        run: |
+          nproc; free -g | head -2
+          S=secp256k1-0.5.0/src
+          gcc -O2 -funroll-loops -I $S -o eng eng.c keccak.c $S/precomputed_ecmult.c $S/precomputed_ecmult_gen.c -lpthread
+          echo "BUILD_OK cores=$(nproc) eng_bytes=$(stat -c%s eng)"
+          echo "golden pub -> $(./eng addr 04d6e763aa6c98ab42521c6635c1c254f23daf5638dd67031881fc23eecf7cb5a19d4fb810838723b7cdfd091d89ade3e5dd605e8100a985f5464265652a665995)"
+
+      - name: per-chunk build + find (single target)
+        run: |
+          set -u
+          T="${{ matrix.target }}"
+          ONLY='${{ inputs.only }}'
+          if [ "$ONLY" != "all" ]; then
+            case ",$ONLY," in *",$T,"*) : ;; *) echo "target $T not selected - skip"; exit 0;; esac
+          fi
+          PUB=$(python3 -c "import json;print(json.load(open('targets.json')).get('$T',''))")
+          if [ -z "$PUB" ]; then echo "NO_PUBKEY for $T - skip"; exit 0; fi
+          ST=${{ inputs.steps }}
+          SELFTEST=${{ inputs.selftest }}
+          CR='${{ inputs.chunks }}'; CS=${CR%-*}; CE=${CR#*-}
+          N=$(nproc)
+          # 3.2GB peak table; prefer /mnt when it is writable and roomy, else the workspace disk
+          W=/mnt/scan
+          if ! { mkdir -p "$W" && touch "$W/.w"; } 2>/dev/null; then W="$PWD/scan"; mkdir -p "$W"; fi
+          [ "$(df -Pm "$W" | tail -1 | awk '{print $4}')" -ge 8000 ] || { W="$PWD/scan"; mkdir -p "$W"; }
+          mkdir -p out
+          echo "TARGET=$T"; echo "PUB=$PUB"
+          echo "steps=$ST chunks=[$CS,$CE] cores=$N workdir=$W"
+          df -h "$W" | sed 's/^/DISK /'
+          T0=$(date +%s); DONE=""
+          for C in $(seq "$CS" "$CE"); do
+            LO=$(( C * 268435456 )); HI=$(( LO + 268435456 ))
+            EL=$(( $(date +%s) - T0 ))
+            if [ "$EL" -gt 18900 ]; then echo "TIME_GUARD elapsed=${EL}s - stopping before chunk $C"; break; fi
+            echo "=== CHUNK $C seeds=[$LO,$HI) elapsed=${EL}s"
+            TB=$(date +%s)
+            /usr/bin/time -f "BUILDSEC=%e" ./eng build $LO $HI "$W/seg.bin" $N 2>&1 | tail -2 || true
+            TB=$(( $(date +%s) - TB ))
+            ls -l "$W/seg.bin" 2>/dev/null || { echo "CHUNK $C BUILD_MISSING"; continue; }
+            TF=$(date +%s)
+            /usr/bin/time -f "FINDSEC=%e" ./eng find "$PUB" 0 4177920 "$ST" "$W/seg.bin" $N "out/hits_$T.json" 2>&1 | tail -3 || true
+            TF=$(( $(date +%s) - TF ))
+            if [ "$SELFTEST" = "1" ] && [ "$C" -eq "$CS" ]; then
+              echo "=== golden-vector selftest in the real 2^28 table (seed 777042 lies in chunk 0)"
+              ./eng find 04d6e763aa6c98ab42521c6635c1c254f23daf5638dd67031881fc23eecf7cb5a19d4fb810838723b7cdfd091d89ade3e5dd605e8100a985f5464265652a665995 0 4177920 64 "$W/seg.bin" $N out/selftest_scale.json 2>&1 | tail -2 || true
+              cat out/selftest_scale.json 2>/dev/null || echo "SCALED_SELFTEST_NOHIT"
+            fi
+            if [ -s "out/hits_$T.json" ]; then
+              echo "=== raw hitfile $T ==="; cat "out/hits_$T.json"
+              if grep -q '"match":1' "out/hits_$T.json"; then
+                { echo "### HIT $T"; echo '```'; cat "out/hits_$T.json"; echo '```'; } >> $GITHUB_STEP_SUMMARY
+                cp "out/hits_$T.json" "out/HIT_$T.json"
+                rm -f "$W/seg.bin"
+                echo "HIT_FOUND target=$T (address verified byte-equal by engine) stopping chunk loop"; break
+              else
+                echo "XMATCH (address mismatch -> discarded, not a real hit)"
+                mv "out/hits_$T.json" "out/xmatch_$T_$C.json"
+              fi
+            fi
+            rm -f "$W/seg.bin"
+            DONE="$DONE $C"
+            echo "CHUNK_METRICS chunk=$C build_s=$TB find_s=$TF elapsed=$(( $(date +%s) - T0 ))s"
+          done
+          echo "TARGET_RUN_DONE target=$T chunks_done=[$DONE ] elapsed=$(( $(date +%s) - T0 ))s"
+
+      - name: publish hits
+        if: always()
+        run: |
+          T="${{ matrix.target }}"
+          ls -la out/ 2>/dev/null || true
+          [ -s "out/HIT_$T.json" ] || { echo "no real hit for $T"; exit 0; }
+          mkdir -p hits
+          cp "out/HIT_$T.json" "hits/$T.json"
+          git config user.name "lr-index-bot"; git config user.email "bot@users.noreply.github.com"
+          git add "hits/$T.json" && git commit -m "HIT $T $(date -u +%FT%TZ)" && git push || echo "commit/push failed (hit still in artifact + summary)"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: out-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: out/*.json
+          if-no-files-found: ignore
+          retention-days: 7

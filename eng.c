@@ -189,6 +189,7 @@ static void report(uint32_t seed,uint32_t id,uint32_t r,uint32_t rlo,uint32_t rh
    too big -> instead we compute id*H incrementally per thread: each thread strides by g_nth_f ids. */
 static secp256k1_ge H_AFF, HNEG_AFF, G_AFF, GNEG_AFF;
 static uint32_t g_id_stride=1;
+static uint32_t g_r0=0;
 
 static void* fw(void*a){
   long t=(long)a;
@@ -209,6 +210,16 @@ static void* fw(void*a){
       secp256k1_gej_set_ge(&cur,&gP); secp256k1_gej_add_ge_var(&cur,&cur,&ng,NULL);
     } else secp256k1_gej_set_ge(&cur,&gP);
   }
+  if(g_r0){
+    unsigned char kb[32]; memset(kb,0,32); uint64_t v=g_r0;
+    for(int k=0;k<4;k++) kb[28+k]=(unsigned char)((v>>(8*(3-k)))&0xFF);
+    secp256k1_pubkey pk2; secp256k1_context*cx=getctx();
+    if(secp256k1_ec_pubkey_create(cx,&pk2,kb)){
+      secp256k1_ge ge3; secp256k1_pubkey_load(cx,&ge3,&pk2);
+      secp256k1_ge ng2; neg_ge(&ng2,&ge3);
+      secp256k1_gej_add_ge_var(&cur,&cur,&ng2,NULL);
+    }
+  }
   /* batch: generate B walk points, batch-normalize, look them up */
   const int B=64;
   secp256k1_gej jb[64]; secp256k1_ge ab[64];
@@ -220,7 +231,7 @@ static void* fw(void*a){
       secp256k1_ge_set_all_gej_var(ab,jb,n);
       for(int i=0;i<n;i++){
         uint64_t k=xkey(&ab[i].x); uint32_t sd;
-        for(int tb=0;tb<g_ntab;tb++) if(lookup(&g_tab[tb],k,&sd)){ report(sd,(uint32_t)id,r+i,g_lo_id,g_hi_id); break; }
+        for(int tb=0;tb<g_ntab;tb++) if(lookup(&g_tab[tb],k,&sd)){ report(sd,(uint32_t)id,g_r0+r+i,g_lo_id,g_hi_id); break; }
         if(g_found) return NULL;
       }
     }
@@ -236,6 +247,7 @@ static int mode_find(char**argv,int argc){
   g_lo_id=(uint32_t)strtoul(argv[3],0,10); g_hi_id=(uint32_t)strtoul(argv[4],0,10);
   g_steps=(uint32_t)strtoul(argv[5],0,10); const char*dir=argv[6]; g_nth_f=atoi(argv[7]);
   if(argc>8) g_hitfile=argv[8];
+  if(argc>9) g_r0=(uint32_t)strtoul(argv[9],0,10);
   secp256k1_context*c=getctx(); secp256k1_pubkey pk; secp256k1_ge Pg;
   if(!secp256k1_ec_pubkey_parse(c,&pk,pub,65)){ printf("pub parse fail\n"); return 2; }
   secp256k1_pubkey_load(c,&Pg,&pk); gP=Pg; addr_of(pub,g_addr);
@@ -267,15 +279,24 @@ static int mode_find(char**argv,int argc){
   uint64_t keys=0; for(int i=0;i<g_ntab;i++) keys+=(g_tab[i].len-16-(NBK+1)*8)/12;
   printf("find: %d chunks %llu keys target=0x",g_ntab,(unsigned long long)keys);
   for(int i=0;i<20;i++) printf("%02x",g_addr[i]);
-  printf(" ids=[%u,%u) steps=%u nth=%d\n",g_lo_id,g_hi_id,g_steps,g_nth_f); fflush(stdout);
+  printf(" ids=[%u,%u) steps=%u r0=%u nth=%d\n",g_lo_id,g_hi_id,g_steps,g_r0,g_nth_f); fflush(stdout);
   g_t0=now();
   pthread_t th[256]; for(long i=0;i<g_nth_f;i++) pthread_create(&th[i],NULL,fw,(void*)i);
   for(int i=0;i<g_nth_f;i++) pthread_join(th[i],NULL);
   printf("find done in %.0fs found=%d\n",now()-g_t0,g_found);
   return g_found?0:1;
 }
+static int mode_addr(const char*h){
+  unsigned char pub[65];
+  if(h[0]=='0'&&(h[1]=='x'||h[1]=='X')) h+=2;
+  if(strlen(h)<130){ printf("short pub\n"); return 2; }
+  for(int i=0;i<65;i++){ unsigned v; if(sscanf(h+2*i,"%2x",&v)!=1){ printf("bad pub\n"); return 2;} pub[i]=(unsigned char)v; }
+  unsigned char a[20]; addr_of(pub,a);
+  printf("0x"); for(int i=0;i<20;i++) printf("%02x",a[i]); printf("\n"); return 0;
+}
 int main(int ac,char**av){
-  if(ac<2){ printf("usage: eng build <lo> <hi> <out> <nth> | find <pub> <lo> <hi> <steps> <dir> <nth> [hitfile]\n"); return 2; }
+  if(ac<2){ printf("usage: eng build <lo> <hi> <out> <nth> | find <pub> <lo> <hi> <steps> <dir> <nth> [hitfile] [r0] | addr <pub>\n"); return 2; }
+  if(!strcmp(av[1],"addr")){ if(ac<3) return 2; return mode_addr(av[2]); }
   if(!strcmp(av[1],"build")){ if(ac<6) return 2;
     g_lo=strtoull(av[2],0,10); g_hi=strtoull(av[3],0,10); g_out=av[4]; g_nth=atoi(av[5]); build_wtab(); return mode_build(); }
   if(!strcmp(av[1],"find")){ if(ac<7) return 2; return mode_find(av,ac); }
