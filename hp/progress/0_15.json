@@ -1,0 +1,18 @@
+{
+ "start": 0,
+ "count": 15,
+ "email": "im@isaacstrock.com",
+ "tried": 13,
+ "WRONG": 1,
+ "HIT": 0,
+ "CF": 12,
+ "OTHER": 0,
+ "get_state": 200,
+ "get_len": 27421,
+ "started": 1793477978,
+ "ip": "20.168.119.17",
+ "hit_pw": null,
+ "note": "IP_BURNED_AFTER_12_CF",
+ "ended": 1793478272,
+ "elapsed": 294
+}
