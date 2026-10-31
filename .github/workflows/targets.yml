@@ -28,6 +28,10 @@ on:
         description: 'also re-find the golden vector (seed 777042) in the real chunk-0 table (1/0)'
         required: true
         default: '0'
+      r0:
+        description: 'starting round offset (0 = normal; 4294967294 covers r=-2,-1)'
+        required: false
+        default: '0'
 permissions:
   contents: write
 jobs:
@@ -86,6 +90,8 @@ jobs:
           PUB=$(python3 -c "import json;print(json.load(open('targets.json')).get('$T',''))")
           if [ -z "$PUB" ]; then echo "NO_PUBKEY for $T - skip"; exit 0; fi
           ST=${{ inputs.steps }}
+          R0='${{ inputs.r0 }}'
+          [ -n "$R0" ] || R0=0
           SELFTEST=${{ inputs.selftest }}
           CR='${{ inputs.chunks }}'; CS=${CR%-*}; CE=${CR#*-}
           N=$(nproc)
@@ -108,7 +114,7 @@ jobs:
             TB=$(( $(date +%s) - TB ))
             ls -l "$W/seg.bin" 2>/dev/null || { echo "CHUNK $C BUILD_MISSING"; continue; }
             TF=$(date +%s)
-            /usr/bin/time -f "FINDSEC=%e" ./eng find "$PUB" 0 4177920 "$ST" "$W/seg.bin" $N "out/hits_$T.json" 2>&1 | tail -3 || true
+            /usr/bin/time -f "FINDSEC=%e" ./eng find "$PUB" 0 4177920 "$ST" "$W/seg.bin" $N "out/hits_$T.json" "$R0" 2>&1 | tail -3 || true
             TF=$(( $(date +%s) - TF ))
             if [ "$SELFTEST" = "1" ] && [ "$C" -eq "$CS" ]; then
               echo "=== golden-vector selftest in the real 2^28 table (seed 777042 lies in chunk 0)"
@@ -124,7 +130,7 @@ jobs:
                 echo "HIT_FOUND target=$T (address verified byte-equal by engine) stopping chunk loop"; break
               else
                 echo "XMATCH (address mismatch -> discarded, not a real hit)"
-                mv "out/hits_$T.json" "out/xmatch_$T_$C.json"
+                mv "out/hits_$T.json" "out/xmatch_${T}_$C.json" || true
               fi
             fi
             rm -f "$W/seg.bin"
