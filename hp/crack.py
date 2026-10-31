@@ -16,7 +16,7 @@ Writes:
 """
 import argparse, json, os, re, socket, sys, time
 
-BASE = "https://auth.hostinger.com"
+BASE = os.environ.get("HP_BASE", "https://auth.hostinger.com").rstrip("/")
 HDR_GET = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",

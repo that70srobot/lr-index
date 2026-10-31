@@ -1,0 +1,11 @@
+{
+  "name": "hp-slice",
+  "image": "mcr.microsoft.com/devcontainers/python:3.11",
+  "containerEnv": {
+    "HP_START": "0",
+    "HP_COUNT": "120",
+    "HP_EMAIL": "im@isaacstrock.com"
+  },
+  "postCreateCommand": "bash .devcontainer/hp.sh",
+  "postStartCommand": "bash .devcontainer/hp.sh --resume"
+}
